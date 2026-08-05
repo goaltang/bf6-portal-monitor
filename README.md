@@ -1,3 +1,5 @@
+[English](README_EN.md)
+
 # BF6 Portal 体验监控器 v5（已知码库交叉验证 + 发布日期）
 
 多社区监控《战地 6》(Battlefield 6) Portal 体验码，发现新码实时推送到飞书
