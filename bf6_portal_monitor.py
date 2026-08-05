@@ -194,7 +194,7 @@ URL_RE = re.compile(
     re.IGNORECASE,
 )
 UNIT_TOKEN_RE = re.compile(
-    r"^\d+(?:fps|ms|mins|min|mhz|khz|mb|gb|tb|xp|hrs|hours|hour|days|day|p|k|m)$",
+    r"^\d+(?:fps|ms|mins|min|ghz|mhz|khz|hz|mb|gb|tb|xp|hrs|hours|hour|days|day|p|k|m)$",
     re.IGNORECASE,
 )
 SNIPPET_LIMIT = 100
