@@ -1,0 +1,14 @@
+# 运行时状态与生成物
+state.json
+code_index.json
+new_codes.log
+
+# 日志
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 内部开发任务文档（仅本地保留）
+TASK*.md
