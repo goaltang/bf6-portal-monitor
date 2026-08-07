@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""BF6 Portal 体验监控器 v5（已知码库交叉验证 + 发布日期）。
+"""BF6 Portal 体验监控器 v6（可用码清单聚合推送）。
 
 数据源：
 - bfportal.gg（主源）：官方 REST API，码是结构化字段，零误报，最可靠
@@ -28,6 +28,12 @@ v5 新增发布日期：YouTube 取 upload_date（与标题/描述同一次 yt-d
 --print 调用），Reddit 取 created_utc，bfportal.gg 取 meta.first_published_at，
 统一渲染为推送消息的"发布:"行（YouTube/bfportal 为 YYYY-MM-DD，Reddit
 为 YYYY-MM-DD HH:MM UTC）。
+
+v6 新增可用码清单聚合推送：不再逐条推送新码。state.json 顶层新增
+ledger 段（可用码账本，键为小写码，上限 30 条，超出淘汰 first_found
+最旧的）。三源发现的新码写入账本，每源轮末若本轮有新码入账，发送一
+条完整清单消息（本轮新码行首 🆕 标注，其余按 first_found 从新到旧排
+列），没有新码的轮次保持静默。
 
 仅依赖 Python 标准库（urllib + subprocess 调 yt-dlp）；本机 requests 常
 TLS 超时，勿改用。
@@ -91,6 +97,12 @@ LARK_CLI_TIMEOUT = 60
 
 ALL_SOURCES = ("bfportal", "youtube", "reddit")
 PUSH_CAP_PER_ROUND = 10  # 每源每轮推送上限，防止首跑/回溯洪水
+
+# ---- 可用码账本（v6；聚合清单推送）
+LEDGER_LIMIT = 30         # 账本容量上限，超出淘汰 first_found 最旧的
+LEDGER_TITLE_LIMIT = 60   # 清单消息里单码标题行截断长度
+LEDGER_MSG_LIMIT = 3000   # 清单消息总长度上限（飞书文本消息限制），超了从最旧码裁
+SOURCE_LABELS = {"bfportal": "bfportal", "youtube": "YouTube", "reddit": "Reddit"}
 
 # ---- YouTube（yt-dlp 子进程）
 YT_KEYWORDS = [  # 轮询使用，每轮取一组，下轮换下一组
@@ -725,6 +737,124 @@ def verify_hits_against_index(hits, index):
     return hits
 
 
+# ---------------------------------------------------------------- 可用码账本（v6）
+#
+# v6 不再逐条推送新码：三源发现的新码写入 state.json 顶层 ledger 段
+# （键为小写码，容量 LEDGER_LIMIT 条，超出淘汰最旧）。每源轮末若本轮
+# 有新码入账，发一条完整清单消息（build_ledger_message），本轮新码行
+# 首 🆕 标注；没有新码的轮次保持静默。
+
+_RATING_EMOJI = {RATING_VALID: "✅", RATING_UNKNOWN: "⚠️", RATING_DEAD: "❌"}
+
+
+def format_feedback_summary(rating, pos, neg, comment_count):
+    """验证结果四元组 -> 清单用精简摘要：评级emoji(正数+/负数-)。"""
+    emoji = _RATING_EMOJI.get(rating, "⚠️")
+    if comment_count < 0:
+        return f"{emoji}(无评论数据)"
+    if comment_count < MIN_COMMENTS_FOR_RATING:
+        return f"{emoji}(样本不足)"
+    return f"{emoji}({pos}+/{neg}-)"
+
+
+def book_code(ledger, code, source, title=None, link=None, published=None,
+              feedback=None, index_hit=False):
+    """把一个码写入可用码账本，返回本轮是否新入账（True=新码）。
+
+    feedback 为 verify_code_feedback 的返回五元组（或 None），入账时渲染
+    成 format_feedback_summary 精简摘要存储；index_hit 仅码库命中时为
+    True。超过 LEDGER_LIMIT 时淘汰 first_found 最旧的。已在账本中的码
+    只刷新（last_seen 与新增字段），不算新入账。
+    """
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    key = code.lower()
+    entry = ledger.get(key)
+    if entry is not None:
+        entry["last_seen"] = now
+        if title:
+            entry["title"] = title
+        if link:
+            entry["link"] = link
+        if published:
+            entry["published"] = published
+        if feedback is not None:
+            entry["feedback"] = format_feedback_summary(*feedback[:4])
+        if index_hit:
+            entry["index_hit"] = True
+        return False
+    ledger[key] = {
+        "code": code,
+        "source": source,
+        "title": title,
+        "link": link,
+        "published": published,
+        "feedback": format_feedback_summary(*feedback[:4]) if feedback is not None else None,
+        "index_hit": bool(index_hit),
+        "first_found": now,
+        "last_seen": now,
+    }
+    while len(ledger) > LEDGER_LIMIT:
+        oldest = min(ledger, key=lambda k: ledger[k].get("first_found") or "")
+        del ledger[oldest]
+    return True
+
+
+def _format_ledger_entry(entry, is_new):
+    """清单里单个码的渲染：第一行 码｜来源｜…，有标题/链接各加一行。"""
+    parts = [
+        entry.get("code") or "?",
+        SOURCE_LABELS.get(entry.get("source"), entry.get("source") or "?"),
+    ]
+    if entry.get("published"):
+        parts.append(f"发布 {entry['published']}")
+    if entry.get("feedback"):
+        parts.append(f"社区反馈 {entry['feedback']}")
+    if entry.get("index_hit"):
+        parts.append("码库 ✅已收录")
+    lines = [("🆕 " if is_new else "") + "｜".join(parts)]
+    if entry.get("title"):
+        title = " ".join(str(entry["title"]).split())[:LEDGER_TITLE_LIMIT]
+        lines.append(f"　　标题：{title}")
+    if entry.get("link"):
+        lines.append(f"　　{entry['link']}")
+    return "\n".join(lines)
+
+
+def build_ledger_message(ledger, new_keys=None):
+    """渲染可用码清单消息（纯文本）。
+
+    new_keys: 本轮新入账码的小写 key（按发现顺序），行首加 🆕 并排最前；
+    其余码按 first_found 从新到旧。总长控制在 LEDGER_MSG_LIMIT 内，超了
+    从最旧码（队尾）开始裁。
+    """
+    new_set = {k for k in (new_keys or []) if k in ledger}
+    rest = sorted(
+        (k for k in ledger if k not in new_set),
+        key=lambda k: ledger[k].get("first_found") or "",
+        reverse=True,
+    )
+    ordered = [k for k in (new_keys or []) if k in new_set] + rest
+    header = (f"🎮 BF6 Portal 可用码清单（更新于 {datetime.now().strftime('%Y-%m-%d %H:%M')}，"
+              f"共 {len(ledger)} 条）")
+    if not ordered:
+        return header
+    blocks = [_format_ledger_entry(ledger[k], k in new_set) for k in ordered]
+    message = header + "\n\n" + "\n\n".join(blocks)
+    while len(message) > LEDGER_MSG_LIMIT and len(blocks) > 1:
+        blocks.pop()  # 排序保证队尾是最旧的码
+        message = header + "\n\n" + "\n\n".join(blocks)
+    return message
+
+
+def push_ledger_message(ledger, new_keys):
+    """本轮有新码入账则发一条聚合清单消息；无新码保持静默。"""
+    if not new_keys:
+        return None
+    ok, info = send_feishu(build_ledger_message(ledger, new_keys))
+    log(f"飞书通知：可用码清单（共 {len(ledger)} 条，本轮新码 {len(new_keys)} 个）-> {info}")
+    return ok, info
+
+
 # ---------------------------------------------------------------- bfportal.gg（v2 逻辑原样保留）
 
 def fetch_latest_experiences():
@@ -896,14 +1026,18 @@ def build_youtube_message(hit, video, feedback=None, published=None):
     return "\n".join(lines)
 
 
-def run_youtube_round(yt_state, verify_budget=None, code_index=None):
-    """一轮 YouTube 监控：轮询关键词搜索，新视频提码推送，按 video id 去重。
+def run_youtube_round(yt_state, verify_budget=None, code_index=None, ledger=None):
+    """一轮 YouTube 监控：轮询关键词搜索，新视频提码入账，按 video id 去重。
 
     verify_budget: {"remaining": N} 本轮评论验证预算（None 表示不验证，
-    即 --no-verify）；验证结果附在推送消息的"社区反馈"行。
+    即 --no-verify）；验证结果存入账本的社区反馈字段。
     code_index: 已知码库索引（None 时不附码库行）；候选码过一遍比对，
     每码附 verified=True/False。
+    ledger: 可用码账本（state["ledger"]）；轮末有新码入账时发一条聚合
+    清单消息（v6）。
     """
+    if ledger is None:
+        ledger = {}
     idx = int(yt_state.get("keyword_index", 0))
     keyword = YT_KEYWORDS[idx % len(YT_KEYWORDS)]
     yt_state["keyword_index"] = (idx + 1) % len(YT_KEYWORDS)
@@ -920,6 +1054,7 @@ def run_youtube_round(yt_state, verify_budget=None, code_index=None):
 
     pushed = 0
     pushed_codes = set()
+    new_keys = []
     desc_budget = YT_DESC_FETCH_MAX
     for video in new_entries:
         text = video["title"]
@@ -955,18 +1090,24 @@ def run_youtube_round(yt_state, verify_budget=None, code_index=None):
                     feedback = verify_code_feedback("youtube", video["id"], hit["code"])
                 else:
                     log(f"YouTube 本轮评论验证预算用尽，{hit['code']} 跳过验证")
-            ok, info = send_feishu(
-                build_youtube_message(hit, video, feedback=feedback, published=published)
-            )
-            log(f"飞书通知：{hit['code']} -> {info}")
+            if book_code(
+                ledger, hit["code"], "youtube",
+                title=video["title"],
+                link=f"https://www.youtube.com/watch?v={video['id']}",
+                published=published,
+                feedback=feedback,
+                index_hit=hit.get("verified", False),
+            ):
+                new_keys.append(code_key)
             pushed_codes.add(code_key)
             pushed += 1
         seen.append(video["id"])
         seen_set.add(video["id"])
 
     yt_state["seen_videos"] = seen[-YT_SEEN_LIMIT:]
+    push_ledger_message(ledger, new_keys)
     if new_entries:
-        log(f"YouTube 本轮完成：推送 {pushed} 条码")
+        log(f"YouTube 本轮完成：新码入账 {pushed} 条")
 
 
 # ---------------------------------------------------------------- Reddit（Arctic Shift 镜像）
@@ -1002,14 +1143,18 @@ def build_reddit_message(hit, item, sub, kind, feedback=None, published=None):
     return "\n".join(lines)
 
 
-def run_reddit_round(rd_state, verify_budget=None, code_index=None):
-    """一轮 Reddit 监控：按数据流 created_utc 水位线取增量，提码推送。
+def run_reddit_round(rd_state, verify_budget=None, code_index=None, ledger=None):
+    """一轮 Reddit 监控：按数据流 created_utc 水位线取增量，提码入账。
 
     数据流 = 版块 × (帖子|评论)，共 6 条。首次接入回溯 1 小时建基线。
     verify_budget: {"remaining": N} 本轮评论验证预算（None 表示不验证）；
     帖子里的码按帖子 id 拉评论，评论里的码按其父帖（link_id）拉评论。
     code_index: 已知码库索引（None 时不附码库行）。
+    ledger: 可用码账本（state["ledger"]）；轮末有新码入账时发一条聚合
+    清单消息（v6）。
     """
+    if ledger is None:
+        ledger = {}
     now = time.time()
     watermarks = rd_state.setdefault("watermarks", {})
     seen = list(rd_state.setdefault("seen_posts", []))
@@ -1017,6 +1162,7 @@ def run_reddit_round(rd_state, verify_budget=None, code_index=None):
     total_processed = 0
     pushed = 0
     pushed_codes = set()
+    new_keys = []
 
     for sub in REDDIT_SUBS:
         for kind in ("posts", "comments"):
@@ -1086,10 +1232,15 @@ def run_reddit_round(rd_state, verify_budget=None, code_index=None):
                             log(f"Reddit 码 {hit['code']} 无法定位父帖，跳过评论验证")
                         else:
                             log(f"Reddit 本轮评论验证预算用尽，{hit['code']} 跳过验证")
-                    ok, info = send_feishu(
-                        build_reddit_message(hit, it, sub, kind, feedback=feedback, published=published)
-                    )
-                    log(f"飞书通知：{hit['code']} -> {info}")
+                    if book_code(
+                        ledger, hit["code"], "reddit",
+                        title=it.get("title") if kind == "posts" else None,
+                        link=f"https://www.reddit.com{it.get('permalink', '')}",
+                        published=published,
+                        feedback=feedback,
+                        index_hit=hit.get("verified", False),
+                    ):
+                        new_keys.append(code_key)
                     pushed_codes.add(code_key)
                     pushed += 1
 
@@ -1097,7 +1248,8 @@ def run_reddit_round(rd_state, verify_budget=None, code_index=None):
                 log(f"Reddit 数据流 {stream} 首次接入：回溯 1 小时建基线，处理 {len(fresh)} 条")
 
     rd_state["seen_posts"] = seen[-REDDIT_SEEN_LIMIT:]
-    log(f"Reddit 本轮完成：处理 {total_processed} 条（帖子+评论），推送 {pushed} 条码")
+    push_ledger_message(ledger, new_keys)
+    log(f"Reddit 本轮完成：处理 {total_processed} 条（帖子+评论），新码入账 {pushed} 条")
 
 
 # ---------------------------------------------------------------- 状态
@@ -1108,13 +1260,14 @@ def default_state():
         "bfportal": {},
         "youtube": {"keyword_index": 0, "seen_videos": []},
         "reddit": {"watermarks": {}, "seen_posts": []},
+        "ledger": {},
     }
 
 
 def load_state():
     """读取 state.json。v3 格式；兼容 v2（max_seen_id 迁入 bfportal 段）。
 
-    缺失/损坏按首次运行处理。
+    旧 v3 状态没有 ledger 段时自动补空账本（v6）。缺失/损坏按首次运行处理。
     """
     if os.path.exists(STATE_FILE):
         try:
@@ -1128,7 +1281,7 @@ def load_state():
             return default_state()
         if state.get("version") == 3 and isinstance(state.get("bfportal"), dict):
             merged = default_state()
-            for key in ("bfportal", "youtube", "reddit"):
+            for key in ("bfportal", "youtube", "reddit", "ledger"):
                 if isinstance(state.get(key), dict):
                     merged[key].update(state[key])
             return merged
@@ -1155,25 +1308,39 @@ def save_state(state):
 
 # ---------------------------------------------------------------- 轮询
 
-def process_new_item(item):
-    """请求单个新条目的详情，过滤后推送。"""
+def process_new_item(item, ledger):
+    """请求单个新条目的详情，过滤后写入可用码账本（v6 不再逐条推送）。
+
+    返回新入账码的小写 key；跳过/已存在返回 None。
+    """
     try:
         detail = fetch_experience_detail(item["id"])
     except Exception as err:  # noqa: BLE001 单条失败不阻塞其余条目
         log(f"获取详情失败 id={item['id']}（{item.get('title')}），跳过：{err}")
-        return
+        return None
     if not should_push(detail):
         reason = "无有效码" if not clean_code(detail.get("code")) else "已标记 broken"
         log(f"跳过 id={item['id']}（{detail.get('title')}）：{reason}")
-        return
+        return None
     code = clean_code(detail.get("code"))
     print(f"🎯 新体验：{detail.get('title')} 码={code}", flush=True)
-    ok, info = send_feishu(build_feishu_text(detail))
-    log(f"飞书通知：{code} -> {info}")
+    meta = detail.get("meta") or {}
+    is_new = book_code(
+        ledger, code, "bfportal",
+        title=detail.get("title"),
+        link=meta.get("html_url") or f"https://bfportal.gg/experiences/{detail.get('id')}/",
+        published=format_iso_date(meta.get("first_published_at")) or None,
+        feedback=None,   # bfportal.gg 无用户评论区，不做评论验证
+        index_hit=True,  # bfportal.gg 本身就是码库，码必然已收录
+    )
+    return code.lower() if is_new else None
 
 
-def run_bfportal_round(bp_state, backfill=0):
-    """一轮 bfportal.gg 轮询（v2 逻辑，状态收进 bfportal 段）。"""
+def run_bfportal_round(bp_state, backfill=0, ledger=None):
+    """一轮 bfportal.gg 轮询（v6：新码写入账本，轮末发一条聚合清单）。"""
+    if ledger is None:
+        ledger = {}
+    new_keys = []
     items = fetch_latest_experiences()
     if not items:
         log("列表中无 ExperiencePage 条目，本轮跳过")
@@ -1186,12 +1353,15 @@ def run_bfportal_round(bp_state, backfill=0):
         if backfill > 0:
             targets = sorted(items, key=lambda x: x["id"], reverse=True)[:backfill]
             for item in sorted(targets, key=lambda x: x["id"]):
-                process_new_item(item)
+                key = process_new_item(item, ledger)
+                if key:
+                    new_keys.append(key)
                 pushed += 1
         bp_state["max_seen_id"] = max_id
         bp_state["initialized_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        suffix = f"，回溯推送 {pushed} 条" if backfill > 0 else ""
+        suffix = f"，回溯入账 {pushed} 条" if backfill > 0 else ""
         log(f"基线已建立, max_seen_id={max_id}{suffix}")
+        push_ledger_message(ledger, new_keys)
         return
 
     new_items = [it for it in items if it["id"] > bp_state["max_seen_id"]]
@@ -1200,9 +1370,12 @@ def run_bfportal_round(bp_state, backfill=0):
         bp_state["max_seen_id"] = max(bp_state["max_seen_id"], max_id)
         return
 
-    for item in sorted(new_items, key=lambda x: x["id"]):  # 按发布顺序推
-        process_new_item(item)
+    for item in sorted(new_items, key=lambda x: x["id"]):  # 按发布顺序入账
+        key = process_new_item(item, ledger)
+        if key:
+            new_keys.append(key)
         bp_state["max_seen_id"] = max(bp_state["max_seen_id"], item["id"])
+    push_ledger_message(ledger, new_keys)
     log(f"本轮处理新体验 {len(new_items)} 条")
 
 
@@ -1286,8 +1459,8 @@ def send_feishu(text):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="BF6 Portal 体验监控器 v5（数据源：bfportal.gg + YouTube + Reddit/Arctic Shift；"
-                    "含评论反馈验证 + 已知码库交叉验证 + 发布日期）"
+        description="BF6 Portal 体验监控器 v6（数据源：bfportal.gg + YouTube + Reddit/Arctic Shift；"
+                    "含评论反馈验证 + 已知码库交叉验证 + 发布日期 + 可用码清单聚合推送）"
     )
     parser.add_argument("--once", action="store_true", help="只执行一轮轮询后退出")
     parser.add_argument(
@@ -1338,7 +1511,7 @@ def main(argv=None):
     verify_note = "关闭（--no-verify）" if args.no_verify else f"开启（每轮最多 {VERIFY_CAP_PER_ROUND} 个码）"
     index_note = f"{code_index.get('count')} 条码" if code_index else "不可用（推送不带码库行）"
     log(f"监控启动：数据源={','.join(sources)} 间隔={interval}s 评论验证 {verify_note} "
-        f"码库索引 {index_note} 飞书通知 {notify_note}")
+        f"码库索引 {index_note} 可用码账本 {len(state['ledger'])} 条 飞书通知 {notify_note}")
 
     try:
         while True:
@@ -1347,24 +1520,26 @@ def main(argv=None):
             if not index_is_fresh(code_index) and time.time() - last_rebuild_try >= 3600:
                 last_rebuild_try = time.time()
                 code_index = refresh_index_if_needed()
-            # 评论验证预算按轮重置；--no-verify 时为 None（各源保持 v3 行为）
+            # 评论验证预算按轮重置；--no-verify 时为 None（账本不带社区反馈字段）
             verify_budget = None if args.no_verify else {"remaining": VERIFY_CAP_PER_ROUND}
             if "bfportal" in sources:
                 try:
-                    run_bfportal_round(state["bfportal"], backfill=backfill)
+                    run_bfportal_round(state["bfportal"], backfill=backfill, ledger=state["ledger"])
                 except Exception as err:  # noqa: BLE001 单源失败不影响其他源
                     log(f"bfportal 源本轮失败（不影响其他源）：{err!r}")
                 backfill = 0  # 回溯仅首次运行生效
                 save_state(state)
             if "youtube" in sources:
                 try:
-                    run_youtube_round(state["youtube"], verify_budget=verify_budget, code_index=code_index)
+                    run_youtube_round(state["youtube"], verify_budget=verify_budget,
+                                      code_index=code_index, ledger=state["ledger"])
                 except Exception as err:  # noqa: BLE001
                     log(f"YouTube 源本轮失败（不影响其他源）：{err!r}")
                 save_state(state)
             if "reddit" in sources:
                 try:
-                    run_reddit_round(state["reddit"], verify_budget=verify_budget, code_index=code_index)
+                    run_reddit_round(state["reddit"], verify_budget=verify_budget,
+                                     code_index=code_index, ledger=state["ledger"])
                 except Exception as err:  # noqa: BLE001
                     log(f"Reddit 源本轮失败（不影响其他源）：{err!r}")
                 save_state(state)

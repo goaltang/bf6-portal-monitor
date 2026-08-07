@@ -1,6 +1,6 @@
 [English](README_EN.md)
 
-# BF6 Portal 体验监控器 v5（已知码库交叉验证 + 发布日期）
+# BF6 Portal 体验监控器 v6（可用码清单聚合推送）
 
 多社区监控《战地 6》(Battlefield 6) Portal 体验码，发现新码实时推送到飞书
 （默认通过 lark-cli 发到监控群，也可配置群 webhook 或 P2P 直发）。
@@ -9,6 +9,9 @@ v4 起对 YouTube/Reddit 源的每个新码自动拉取来源评论做**社区�
 v5 起新增**已知码库交叉验证**（候选码与 bfportal.gg 全量码库比对，
 推送标注 已收录/未收录，根治英文单词类误报）和**发布日期**（三源推送
 均附"发布:"行，便于判断码的新鲜度）。
+v6 起**不再逐条推送新码**：维护一个"可用码账本"（state.json 的 ledger
+段，最多 30 条码），每次发现新码发一条完整清单消息，清单包含所有已知
+可用码，本轮新出现的码行首 🆕 显眼标注；没有新码的轮次保持静默。
 
 ## 背景
 
@@ -229,55 +232,43 @@ nohup python3 bf6_portal_monitor.py >> run.log 2>&1 &
 单源失败（网络/yt-dlp 异常）记日志跳过，不影响其他源；每源每轮推送上限
 10 条，防止首跑洪水。
 
-## 推送消息格式
+## 推送消息格式（v6：可用码清单聚合推送）
 
-bfportal.gg 新体验：
-
-```
-🎯 新 Portal 体验: 030 Portal Lab
-码: 1ZC5T
-🔥 刷枪服务器          ← 仅当 xp_farm=true
-玩家/Bot: 64/99
-作者: xxx
-发布: 2026-08-03       ← v5 新增（meta.first_published_at）
-说明: <description 前 150 字符，已去 markdown 符号>
-https://bfportal.gg/experiences/xxx/
-```
-
-YouTube 新码（v5 含发布行 + 码库行）：
+v6 起不再逐条推送新码。每个源的轮次结束时，若本轮有新码入账，发送
+**一条聚合清单消息**——包含账本里全部可用码，本轮新入账的码行首 🆕
+显眼标注；没有新码的轮次不发任何消息（保持静默）。同一轮多个源都有
+新码时各源各发一条清单；同一源内多个新码只发一条聚合消息。
 
 ```
-📺 YouTube 新码: 1Y8CM
-视频: NEW BF6 WEAPON XP FARM 2 V 64 BOTS //CODE 1Y8CM
-频道: Sensation
-发布: 2026-08-03       ← v5 新增（仅抓了描述的视频才有）
-说明: <码附近一句话>
-码库: ➖ 未收录         ← v5 新增（命中时：码库: ✅ 已收录 (体验标题)）
-社区反馈: ✅ 可能有效 (正面3/负面0, 评论12条)
-https://www.youtube.com/watch?v=<id>
+🎮 BF6 Portal 可用码清单（更新于 2026-08-07 10:00，共 5 条）
+
+🆕 ZD7HY｜YouTube｜发布 2026-08-07｜社区反馈 ✅(5+/0-)｜码库 ✅已收录
+　　标题：NEW BF6 WEAPON XP FARM //CODE ZD7HY
+　　https://www.youtube.com/watch?v=<id>
+
+ABC12｜bfportal｜发布 2026-08-05｜码库 ✅已收录
+　　标题：030 Portal Lab
+　　https://bfportal.gg/experiences/xxx/
+
+ZZ999｜Reddit｜发布 2026-08-06 12:34 UTC｜社区反馈 ❌(0+/2-)
+　　https://www.reddit.com<permalink>
 ```
 
-Reddit 新码（v5 含发布行 + 码库行）：
+规则：
 
-```
-💬 Reddit 新码: ZS57D
-来源: r/battlefield6 (帖子)
-标题: <帖子标题>          ← 评论没有标题，省略此行
-发布: 2026-08-04 12:34 UTC   ← v5 新增
-说明: <码附近一句话>
-码库: ✅ 已收录 (BLACKSITE: ASCENDANT)   ← v5 新增（未收录时：码库: ➖ 未收录）
-社区反馈: ❌ 可能失效 (正面0/负面2, 评论8条)
-https://www.reddit.com<permalink>
-```
-
-社区反馈行的三种形态：
-
-- `社区反馈: ✅ 可能有效 (正面N/负面M, 评论K条)`（或 ❌/⚠️）
-- `社区反馈: ⚠️ 不确定 (样本不足, 评论K条)` —— 评论数 < 3
-- `社区反馈: ⚠️ 不确定 (无评论数据)` —— 评论抓取失败/该源无评论
-
-`--no-verify` 或当轮验证预算（5 个码）用尽时，消息不带社区反馈行
-（与 v3 格式相同）。码库索引不可用时不带"码库"行。
+- 每码一块（块间空行），占 1~3 行：第一行 `码｜来源｜发布 X｜社区反馈 X｜码库 ✅已收录`
+  （发布/社区反馈/码库段仅在有时出现）；有标题加第二行（全角空格缩进，
+  截断 60 字符）；有链接加第三行
+- 排序：本轮新码在前（多个新码按发现顺序，行首 🆕），其余码按
+  first_found 从新到旧
+- 社区反馈是评论验证结果的精简摘要：评级 emoji + `(正面数+/负面数-)`；
+  评论数 < 3 显示 `⚠️(样本不足)`，评论抓取失败显示 `⚠️(无评论数据)`；
+  未验证的码（bfportal 源 / `--no-verify` / 当轮验证预算用尽）不带此段
+- `码库 ✅已收录` 仅码库命中时显示（bfportal 源本身就是码库，恒命中）；
+  码库索引不可用时不带
+- 账本上限 30 条，超出淘汰 first_found 最旧的；消息总长超 3000 字符时
+  从最旧码开始裁
+- 首行时间戳为本地时间（`%Y-%m-%d %H:%M`）
 
 ## 状态文件 state.json
 
@@ -286,10 +277,13 @@ https://www.reddit.com<permalink>
   "version": 3,
   "bfportal": { "max_seen_id": 1273 },
   "youtube":  { "keyword_index": 0, "seen_videos": ["..."] },
-  "reddit":   { "watermarks": {"BattlefieldPortal:posts": 1785860145}, "seen_posts": ["posts:..."] }
+  "reddit":   { "watermarks": {"BattlefieldPortal:posts": 1785860145}, "seen_posts": ["posts:..."] },
+  "ledger":   { "zd7hy": { "code": "ZD7HY", "source": "youtube", "...": "..." } }
 }
 ```
 
+- `ledger`（v6 新增）：可用码账本，键为小写码，上限 30 条（超出淘汰
+  first_found 最旧的）；旧 v3 状态无此段时自动补空
 - 自动从 v2 状态（`{"version": 2, "max_seen_id": N}`）升级，bfportal 基线保留
 - YouTube 按 video id 去重（保留最近 500 个）；Reddit 按 created_utc
   水位线 + 已见 id（保留最近 1000 个）双重去重
@@ -306,6 +300,8 @@ https://www.reddit.com<permalink>
 | `test_extract_codes.py` | 码提取单元测试（32 用例，含真实码样本与误报样本）：`python3 test_extract_codes.py` |
 | `test_feedback.py` | 评论反馈验证单元测试（评级逻辑/关键词分类/消息格式，无网络）：`python3 test_feedback.py` |
 | `test_code_index.py` | 码库交叉验证单元测试（假码库比对：收录/未收录/大小写/过期/降级，无网络）：`python3 test_code_index.py` |
+| `test_ledger.py` | 可用码账本单元测试（v6；清单格式/容量淘汰/state 兼容，无网络、不发飞书）：`python3 test_ledger.py` |
+| `manual_push_format_v6.py` | v6 清单格式验证脚本（构造模拟账本真实发一条带"格式测试"标注的飞书消息，手动运行） |
 | `manual_push_format_v1.py` / `manual_push_format_v3.py` | 飞书推送格式验证脚本（会真实发消息；由 test_push_format.py / test_v3_push_format.py 改名，避免 pytest 误收集真实发送） |
 | `test_v4_push_format.py` | v4 格式验证：现场拉评论验证 + 发一条标注"格式测试"的消息 |
 | `test_v5_push_format.py` | v5 格式验证：现场抓发布日期+码库比对 + 发一条标注"格式测试"的三源样例消息 |
