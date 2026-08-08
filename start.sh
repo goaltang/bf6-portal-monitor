@@ -14,6 +14,8 @@ case "${1:-start}" in
       exit 0
     fi
     export PYTHONUTF8=1  # 强制 Python IO 走 UTF-8，与程序内 stdout 编码加固双保险
+    # 加载 LLM 评论裁判所需的 OPENAI_API_KEY/OPENAI_BASE_URL（v6.5；文件不存在则跳过）
+    [ -f ~/.qwen/.env ] && set -a && . ~/.qwen/.env && set +a
     nohup python3 bf6_portal_monitor.py >> monitor.log 2>&1 &
     sleep 2
     if pgrep -f "bf6_portal_monitor.py" > /dev/null; then
